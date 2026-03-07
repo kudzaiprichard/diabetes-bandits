@@ -16,6 +16,7 @@ Key design choices:
 Author: Refactored for bandit research
 Date: 2025
 """
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -559,7 +560,10 @@ def print_dataset_summary(df: pd.DataFrame) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Generating contextual bandit dataset...")
+    # Anchor path to project root (two levels up from src/data_generator.py)
+    ROOT = Path(__file__).resolve().parent.parent
+    DATA_DIR = ROOT / "data"
+    DATA_DIR.mkdir(exist_ok=True)
 
     df = generate_bandit_dataset(
         n_patients=20000,
@@ -568,9 +572,9 @@ if __name__ == "__main__":
         include_counterfactuals=True,
     )
 
-    os.makedirs("../data", exist_ok=True)
-    df.to_csv("data/bandit_dataset.csv", index=False)
-    print(f"Saved data/bandit_dataset.csv ({len(df)} rows)")
+    out_path = DATA_DIR / "bandit_dataset.csv"
+    df.to_csv(out_path, index=False)
+    print(f"Saved {out_path} ({len(df)} rows)")
 
     print_dataset_summary(df)
     print("Done. Dataset ready for bandit training.")

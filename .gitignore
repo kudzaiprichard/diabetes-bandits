@@ -12,20 +12,16 @@ ENV/
 .ipynb_checkpoints/
 
 # Data files
-data/*.csv
-data/*.xlsx
+data/
 !data/README.md
 
 # Model files
-models/*.pkl
-models/*.joblib
-models/*.h5
+models/
 !models/README.md
 
 # Results
-results/*.png
-results/*.pdf
-results/*.html
+results/
+!results/README.md
 
 # JetBrains / DataSpell
 .idea/
