@@ -619,9 +619,9 @@ class NeuralThompson(NeuralBanditBase):
         return int(np.argmax(sampled_rewards)), sampled_rewards
 
     def compute_confidence(
-        self,
-        x: np.ndarray,
-        n_draws: int = 200,
+            self,
+            x: np.ndarray,
+            n_draws: int = 200,
     ) -> Dict:
         """
         Estimate confidence by drawing from the posterior multiple times
@@ -643,6 +643,8 @@ class NeuralThompson(NeuralBanditBase):
                 confidence_pct: int — win rate as a percentage (0-100)
                 confidence_label: str — HIGH (85+), MODERATE (60-84), LOW (<60)
                 posterior_means: {treatment_name: float} — deterministic estimates
+                runner_up: treatment with second highest win rate (ties broken by posterior mean)
+                runner_up_win_rate: float — runner-up's win rate
                 mean_gap: float — gap between 1st and 2nd posterior means
         """
         self.network.eval()
@@ -692,20 +694,35 @@ class NeuralThompson(NeuralBanditBase):
         else:
             confidence_label = "LOW"
 
+        # ── Build dicts ──
+        win_rates_dict = {
+            IDX_TO_TREATMENT[k]: round(float(win_rates[k]), 3)
+            for k in range(N_TREATMENTS)
+        }
+        posterior_means_dict = {
+            IDX_TO_TREATMENT[k]: round(float(posterior_means[k]), 2)
+            for k in range(N_TREATMENTS)
+        }
+
+        # ── Runner-up: sort by win rate, break ties with posterior mean ──
+        sorted_treatments = sorted(
+            win_rates_dict.items(),
+            key=lambda t: (t[1], posterior_means_dict[t[0]]),
+            reverse=True,
+        )
+        runner_up = sorted_treatments[1][0]
+        runner_up_win_rate = sorted_treatments[1][1]
+
         return {
-            "win_rates": {
-                IDX_TO_TREATMENT[k]: round(float(win_rates[k]), 3)
-                for k in range(N_TREATMENTS)
-            },
+            "win_rates": win_rates_dict,
             "recommended": recommended,
             "recommended_idx": recommended_idx,
             "recommended_win_rate": round(float(recommended_win_rate), 3),
             "confidence_pct": confidence_pct,
             "confidence_label": confidence_label,
-            "posterior_means": {
-                IDX_TO_TREATMENT[k]: round(float(posterior_means[k]), 2)
-                for k in range(N_TREATMENTS)
-            },
+            "posterior_means": posterior_means_dict,
+            "runner_up": runner_up,
+            "runner_up_win_rate": round(float(runner_up_win_rate), 3),
             "mean_gap": round(float(mean_gap), 2),
             "n_draws": n_draws,
         }
