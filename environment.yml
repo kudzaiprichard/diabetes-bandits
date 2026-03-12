@@ -7,13 +7,13 @@ dependencies:
   - python=3.12
   - jupyterlab
   - ipywidgets
-  - pandas
-  - numpy
-  - scikit-learn
+  - pandas=3.0.1
+  - numpy=1.26.4
+  - scikit-learn=1.8.0
   - matplotlib
   - seaborn
   - xgboost
-  - joblib
+  - joblib=1.5.2
   - ipykernel
   - pip
   - pip:
