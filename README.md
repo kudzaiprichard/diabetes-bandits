@@ -22,7 +22,7 @@ Selecting the right glucose-lowering medication for a Type 2 Diabetes patient de
 
 ## Approach
 
-The project implements and compares **three families** of contextual bandit algorithms, evaluated both offline (using logged data) and online (via simulation).
+The project implements and compares **two families** of contextual bandit algorithms, evaluated both offline (using logged data) and online (via simulation).
 
 ### Models
 
@@ -30,7 +30,6 @@ The project implements and compares **three families** of contextual bandit algo
 |--------|-------|----------|
 | **Tree-based** | XGBoost Ensemble | 5 separate reward regressors (one per treatment), greedy/softmax policy on top |
 | **Linear online** | LinUCB | Linear reward model with UCB exploration, fully online, no pre-training |
-| **VW** | Vowpal Wabbit `cb_explore_adf` | Online linear bandit with softmax, epsilon-greedy, bag, or cover exploration |
 | **Neural** | NeuralGreedy | Multi-head deep reward network, pure exploitation |
 | **Neural** | NeuralEpsilon | Same network + epsilon-greedy exploration with decay |
 | **Neural** | NeuralUCB | Last-layer uncertainty via covariance matrix + UCB score |
@@ -57,20 +56,12 @@ diabetes-bandits/
 │
 ├── data/
 │   ├── bandit_dataset.csv       # Full dataset (20K patients, counterfactuals, propensities)
-│   ├── obp/                     # Numpy arrays for Open Bandit Pipeline
-│   │   ├── context.npy
-│   │   ├── action.npy
-│   │   ├── reward.npy
-│   │   ├── pscore.npy
-│   │   └── expected_reward.npy
-│   └── vw_train.txt             # Vowpal Wabbit format
 │
 ├── src/                         # Python package — all reusable code
 │   ├── __init__.py              # Re-exports everything for clean imports
 │   ├── data_generator.py        # Synthetic data generator + reward oracle
 │   ├── feature_engineering.py   # Preprocessing, scaling, interaction features
 │   ├── reward_model.py          # XGBoost reward models (ensemble + single)
-│   ├── vw_bandit.py             # Vowpal Wabbit contextual bandit wrapper
 │   ├── neural_bandit.py         # PyTorch neural bandits (Greedy/Eps/UCB/Thompson)
 │   ├── policies.py              # Policy classes (7 strategies + factory)
 │   ├── online_simulator.py      # Online simulation engine
@@ -80,15 +71,13 @@ diabetes-bandits/
 ├── notebooks/                   # Jupyter experiments (run in order)
 │   ├── 01_data_exploration.ipynb
 │   ├── 02_reward_modeling.ipynb
-│   ├── 03_vw_contextual_bandit.ipynb
-│   ├── 04_neural_bandit.ipynb
-│   ├── 05_online_simulation.ipynb
-│   ├── 06_offline_evaluation.ipynb
-│   └── 07_model_comparison.ipynb
+│   ├── 03_neural_bandit.ipynb
+│   ├── 04_online_simulation.ipynb
+│   ├── 05_offline_evaluation.ipynb
+│   └── 06_model_comparison.ipynb
 │
 ├── models/                      # Saved model checkpoints
 │   ├── reward_model/            # XGBoost ensemble (5 JSON files + meta)
-│   ├── vw_bandit.model          # VW model binary
 │   ├── neural_greedy.pt         # PyTorch checkpoints
 │   ├── neural_epsilon.pt
 │   ├── neural_ucb.pt
@@ -109,7 +98,7 @@ Generates 20,000 synthetic T2D patients with clinically grounded reward function
 - **`reward_oracle(context, treatment, noise)`** — the ground-truth reward function that bandits try to learn. Returns expected HbA1c reduction based on patient-treatment match. Callable with `noise=True` for stochastic simulation or `noise=False` for expected values.
 - **`generate_patient(rng)`** — samples a realistic patient context with correlated features (e.g., eGFR declines with age, C-peptide drops with disease duration).
 - **`generate_bandit_dataset()`** — produces the full dataset with a clinical logging policy, propensity scores, counterfactual rewards for all 5 treatments, and oracle-optimal actions.
-- **Exports** to CSV, OBP numpy format, and VW text format.
+- **Exports** to CSV.
 
 ### `feature_engineering.py`
 `FeaturePipeline` class that handles the full preprocessing chain:
@@ -123,13 +112,6 @@ Two XGBoost approaches for estimating `E[reward | context, treatment]`:
 - **`RewardModelEnsemble`** — trains 5 independent XGBoost regressors, one per treatment. Recommended approach: each model specializes in its treatment's feature interactions.
 - **`RewardModelSingle`** — single XGBoost with one-hot treatment encoding. Simpler but typically underperforms.
 - Both support: prediction for all treatments, greedy action selection, evaluation against oracle, feature importance extraction, save/load.
-
-### `vw_bandit.py`
-Wraps Vowpal Wabbit's `--cb_explore_adf` (action-dependent features):
-- 5 exploration strategies: epsilon-greedy, softmax, bag, cover, squareCB
-- Formats patient contexts and treatment actions into VW's multi-line example format
-- Supports both online learning (`learn_one`) and batch training (`train_batch`)
-- `vw_exploration_sweep()` — grid search across 11 strategy configurations
 
 ### `neural_bandit.py`
 PyTorch neural contextual bandits sharing a common `RewardNetwork`:
@@ -158,12 +140,11 @@ Runs the full online contextual bandit loop:
 4. Each agent updates its model
 5. Track reward, regret, accuracy per round
 
-Agent builders for every model type: `make_reward_model_agent`, `make_neural_bandit_agent`, `make_vw_agent`, `make_linucb_agent`, `make_random_agent`, `make_oracle_agent`. All agents run on the same patient stream for fair comparison. Provides windowed metrics for learning curve visualization.
+Agent builders for every model type: `make_reward_model_agent`, `make_neural_bandit_agent`, `make_linucb_agent`, `make_random_agent`, `make_oracle_agent`. All agents run on the same patient stream for fair comparison. Provides windowed metrics for learning curve visualization.
 
 ### `evaluation.py`
 Offline policy evaluation without interacting with the environment:
-- **Custom estimators** (always available): IPS, SNIPS, DM, DR with confidence intervals
-- **OBP integration** (when installed): wraps Open Bandit Pipeline's estimators
+- **Custom estimators**: IPS, SNIPS, DM, DR with confidence intervals
 - **Counterfactual evaluation**: exact policy value using ground-truth potential outcomes
 - **`OfflinePolicyEvaluator`** — main class that brings all estimators together
 - **`compare_policies()`** — side-by-side table of multiple policies
@@ -203,15 +184,7 @@ Trains and evaluates XGBoost reward models.
 - Subgroup accuracy analysis (BMI × HbA1c heatmap)
 - Saves best model to `models/reward_model/` (17 cells)
 
-### `03_vw_contextual_bandit.ipynb`
-Trains Vowpal Wabbit contextual bandits with multiple exploration strategies.
-- Softmax, epsilon-greedy, bag, cover trained and evaluated
-- Full exploration sweep across 11 configurations
-- Learning rate and number-of-passes sensitivity
-- Action probability inspection (how VW distributes probability mass)
-- Saves best VW model (16 cells)
-
-### `04_neural_bandit.ipynb`
+### `03_neural_bandit.ipynb`
 Trains all 4 PyTorch neural bandit variants.
 - NeuralGreedy, NeuralEpsilon, NeuralUCB, NeuralThompson
 - Training curves, action distributions, side-by-side comparison
@@ -220,28 +193,28 @@ Trains all 4 PyTorch neural bandit variants.
 - Reward prediction quality vs oracle (scatter + correlation)
 - Saves all 4 models (17 cells)
 
-### `05_online_simulation.ipynb`
+### `04_online_simulation.ipynb`
 Simulates online learning with exploration vs exploitation.
-- 9 agents compared on the same patient stream (10K and 50K rounds)
-- Agents: Random, Oracle, XGB+Greedy, XGB+EpsGreedy, XGB+Boltzmann, LinUCB, VW, NeuralUCB, NeuralThompson
+- 7 agents compared on the same patient stream (10K and 50K rounds)
+- Agents: Random, Oracle, XGB+Greedy, XGB+EpsGreedy, XGB+Boltzmann, LinUCB, NeuralUCB, NeuralThompson
 - Cumulative regret and reward curves
 - Windowed learning curves (accuracy and regret over time)
 - Action distribution shift visualization (exploration → exploitation)
 - Converged performance analysis (last 2000 rounds)
 - Extended 50K-round simulation for long-term behavior (19 cells)
 
-### `06_offline_evaluation.ipynb`
+### `05_offline_evaluation.ipynb`
 Formal offline policy evaluation using OPE estimators.
-- 8 policies × 5 estimators (IPS, SNIPS, DM, DR, Counterfactual)
+- 6 policies × 5 estimators (IPS, SNIPS, DM, DR, Counterfactual)
 - Estimator agreement heatmap and correlation analysis
 - Pairwise statistical significance tests (bootstrap + paired t-test, p-value matrix)
 - Subgroup analysis: BMI, HbA1c, Age groups with treatment selection heatmaps
 - Estimator reliability: bias check against counterfactual ground truth
 - Identifies most reliable OPE estimator (19 cells)
 
-### `07_model_comparison.ipynb`
+### `06_model_comparison.ipynb`
 Final head-to-head comparison bringing everything together.
-- All 7 models trained and evaluated offline on the same test set
+- All models trained and evaluated offline on the same test set
 - Master bar charts: policy value, regret, accuracy
 - Per-treatment accuracy heatmap across all models
 - Confusion matrices for top 3 models
@@ -263,12 +236,6 @@ conda env create -f environment.yml
 conda activate diabetes-bandits
 ```
 
-If `vowpalwabbit` fails during env creation, install it separately:
-
-```bash
-pip install vowpalwabbit obp torch loguru
-```
-
 ### 2. Generate the dataset
 
 ```bash
@@ -276,7 +243,7 @@ cd diabetes-bandits
 python -m src.data_generator
 ```
 
-This creates `data/bandit_dataset.csv`, `data/obp/`, and `data/vw_train.txt`.
+This creates `data/bandit_dataset.csv`.
 
 ### 3. Run the notebooks
 
@@ -284,7 +251,7 @@ This creates `data/bandit_dataset.csv`, `data/obp/`, and `data/vw_train.txt`.
 jupyter lab
 ```
 
-Open notebooks in order: `01` → `02` → ... → `07`. Each notebook is self-contained but builds on models/insights from previous ones.
+Open notebooks in order: `01` → `02` → ... → `06`. Each notebook is self-contained but builds on models/insights from previous ones.
 
 ### 4. Using the modules directly
 
@@ -332,7 +299,6 @@ Results are generated by running the notebooks. Expected findings:
 - **XGBoost Ensemble** provides a strong offline baseline due to its accurate reward predictions
 - **NeuralUCB and NeuralThompson** achieve the best online performance by balancing exploration and exploitation
 - **LinUCB** learns effectively from scratch (no pre-training) but converges more slowly
-- **VW** is fast to train and competitive, especially with softmax or bag exploration
 - **Exploration matters**: greedy policies plateau while UCB/Thompson continue improving
 - **OPE estimators**: DR has the lowest bias; SNIPS is more stable than raw IPS
 - **Subgroup analysis** reveals that models struggle most with borderline patients where multiple treatments have similar expected rewards
@@ -346,8 +312,6 @@ Results are generated by running the notebooks. Expected findings:
 | Python | 3.10 | Runtime |
 | PyTorch | latest | Neural contextual bandits |
 | XGBoost | latest | Reward modeling |
-| Vowpal Wabbit | latest | Online contextual bandits |
-| Open Bandit Pipeline | latest | Offline policy evaluation |
 | scikit-learn | latest | Preprocessing, metrics |
 | pandas / numpy | latest | Data manipulation |
 | matplotlib / seaborn | latest | Visualization |
@@ -360,10 +324,8 @@ Results are generated by running the notebooks. Expected findings:
 - Zhou et al., *"Neural Contextual Bandits with UCB-based Exploration"*, ICLR 2020
 - Zhang et al., *"Neural Thompson Sampling"*, ICLR 2021
 - Li et al., *"A Contextual-Bandit Approach to Personalized News Article Recommendation"*, WWW 2010 (LinUCB)
-- Saito et al., *"Open Bandit Pipeline"*, 2021
 - Agarwal et al., *"A Reductions Approach to Fair and Robust Contextual Bandits"*, ICML 2018
 - ADA Standards of Medical Care in Diabetes, 2024
-- Vowpal Wabbit documentation: https://vowpalwabbit.org/
 
 ---
 
