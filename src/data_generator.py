@@ -39,7 +39,7 @@ CONTEXT_FEATURES = [
     "hypertension", "bp_systolic", "ldl", "hdl", "triglycerides", "alt",
 ]
 
-# Treatment-specific noise std devs
+# Treatment-specific noise std devs (in abstract-score units; scaled to pp below)
 TREATMENT_NOISE = {
     "Metformin": 0.3,
     "GLP-1": 0.4,
@@ -47,6 +47,15 @@ TREATMENT_NOISE = {
     "DPP-4": 0.3,
     "Insulin": 0.5,
 }
+
+# G-3: Rescale the abstract "benefit score" produced by the hand-written oracle
+# into clinically plausible HbA1c percentage-point reductions. With SCALE=0.25
+# the ideal Metformin patient (score ~6) predicts ~1.5 pp, the ideal Insulin
+# patient (score ~10) predicts ~2.5 pp, and the hard ceiling is 3.0 pp — all
+# consistent with published effect sizes. Noise scales proportionally, keeping
+# signal-to-noise unchanged.
+REWARD_SCALE = 0.25
+REWARD_CAP_PP = 3.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,10 +67,10 @@ def reward_oracle(context: Dict, treatment: str, noise: bool = True) -> float:
     Compute expected HbA1c reduction for a patient-treatment pair.
 
     Design principles:
-    - Each treatment has a STRONG niche where it dominates (reward 5-8)
-    - Each treatment has clear ANTI-niches where it's poor (reward 0-2)
+    - Each treatment has a STRONG niche where it dominates (reward ~1.5-2.5 pp)
+    - Each treatment has clear ANTI-niches where it's poor (reward ~0-0.5 pp)
     - Niches are sized to produce ~15-25% optimal per treatment
-    - Reward range [0, 10] to avoid ceiling effects
+    - Output is scaled to HbA1c percentage-point reductions, capped at 3.0 pp
     - Penalties are aggressive to create separation
 
     Treatment niches (designed for balanced patient distribution):
@@ -77,7 +86,8 @@ def reward_oracle(context: Dict, treatment: str, noise: bool = True) -> float:
         noise: whether to add stochastic noise
 
     Returns:
-        HbA1c reduction (higher = better, clipped to [0, 10])
+        HbA1c reduction in percentage points (higher = better, clipped to
+        [0, REWARD_CAP_PP]).
     """
     age = context["age"]
     bmi = context["bmi"]
@@ -276,7 +286,9 @@ def reward_oracle(context: Dict, treatment: str, noise: bool = True) -> float:
         sigma = TREATMENT_NOISE[treatment]
         reward += np.random.normal(0, sigma)
 
-    return float(np.clip(reward, 0.0, 10.0))
+    # G-3: rescale abstract benefit → HbA1c pp reduction, cap at clinical ceiling
+    reward *= REWARD_SCALE
+    return float(np.clip(reward, 0.0, REWARD_CAP_PP))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

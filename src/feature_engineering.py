@@ -152,7 +152,7 @@ class FeaturePipeline:
                 i for i, f in enumerate(self.features) if f in CONTINUOUS_FEATURES + INTERACTION_FEATURES
             ]
             self.scaler = StandardScaler()
-            self.scaler.fit(feat_df.iloc[:, self._continuous_idx])
+            self.scaler.fit(feat_df.iloc[:, self._continuous_idx].to_numpy())
 
         self._fitted = True
         logger.info(f"FeaturePipeline fitted: {len(self.features)} features, scale={self.scale}")
