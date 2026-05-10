@@ -23,6 +23,13 @@ models/
 results/
 !results/README.md
 
+# Training runs
+runs/
+!runs/README.md
+
+# Internal design docs (not shipped with the repo)
+.docs/
+
 # JetBrains / DataSpell
 .idea/
 *.iml
