@@ -98,16 +98,13 @@ class RewardNetwork(nn.Module):
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Extract last hidden layer features (for uncertainty estimation).
+        Extract last hidden layer features.
 
-        Args:
-            x: (batch, input_dim)
-
-        Returns:
-            (batch, feature_dim) last-layer representations
+        Note: grad propagation is NOT blocked here — Phase 2 attribution
+        (integrated gradients) needs ∂φ/∂x. Callers that don't want grads
+        (posterior updates, confidence) wrap their own ``torch.no_grad()``.
         """
-        with torch.no_grad():
-            return self.backbone(x)
+        return self.backbone(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,17 +169,36 @@ class NeuralBanditBase:
         val_fraction: float = 0.1,
         early_stopping_patience: int = 10,
         verbose: bool = True,
+        counterfactuals: Optional[np.ndarray] = None,
     ) -> Dict:
         """
         Train the reward network.
 
-        Only updates the head corresponding to the observed action
-        for each example (partial feedback).
+        Default mode (``counterfactuals=None``): partial-feedback MSE —
+        only the head for the logged action gets gradient. This is the
+        realistic online setting.
+
+        G-2 mode (``counterfactuals`` is an (n, K) oracle matrix): full-feedback
+        MSE — every head gets gradient from every row. We only generate this
+        matrix for synthetic experiments; it is **never** used in wild data.
+
+        Including counterfactuals uses up to 80% of the signal that partial
+        feedback leaves on the floor and is essential to make Thompson's
+        per-arm posterior reliable on rare arms.
         """
         n = X.shape[0]
         n_val = int(n * val_fraction)
         indices = np.random.permutation(n)
         val_idx, train_idx = indices[:n_val], indices[n_val:]
+
+        use_cf = counterfactuals is not None
+        if use_cf:
+            assert counterfactuals.shape == (n, N_TREATMENTS), (
+                f"counterfactuals shape {counterfactuals.shape} "
+                f"does not match (n={n}, K={N_TREATMENTS})"
+            )
+            cf_t = torch.FloatTensor(counterfactuals[train_idx]).to(self.device)
+            cf_v = torch.FloatTensor(counterfactuals[val_idx]).to(self.device)
 
         X_t = torch.FloatTensor(X[train_idx]).to(self.device)
         a_t = torch.LongTensor(actions[train_idx]).to(self.device)
@@ -192,7 +208,10 @@ class NeuralBanditBase:
         a_v = torch.LongTensor(actions[val_idx]).to(self.device)
         r_v = torch.FloatTensor(rewards[val_idx]).to(self.device)
 
-        train_ds = TensorDataset(X_t, a_t, r_t)
+        if use_cf:
+            train_ds = TensorDataset(X_t, a_t, r_t, cf_t)
+        else:
+            train_ds = TensorDataset(X_t, a_t, r_t)
         train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
 
         best_val_loss = float("inf")
@@ -205,13 +224,24 @@ class NeuralBanditBase:
             epoch_loss = 0.0
             n_batches = 0
 
-            for X_batch, a_batch, r_batch in train_loader:
+            for batch in train_loader:
                 self.optimizer.zero_grad()
+                if use_cf:
+                    X_batch, a_batch, r_batch, cf_batch = batch
+                else:
+                    X_batch, a_batch, r_batch = batch
+
                 pred_all = self.network(X_batch)  # (batch, K)
 
-                # Select predictions for observed actions only
-                pred = pred_all[torch.arange(len(a_batch)), a_batch]
-                loss = nn.MSELoss()(pred, r_batch)
+                if use_cf:
+                    # G-2: MSE across ALL heads per row against the full
+                    # counterfactual matrix. 5x more signal per row than
+                    # partial feedback.
+                    loss = nn.MSELoss()(pred_all, cf_batch)
+                else:
+                    # Partial feedback — only the observed action contributes.
+                    pred = pred_all[torch.arange(len(a_batch)), a_batch]
+                    loss = nn.MSELoss()(pred, r_batch)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
@@ -227,8 +257,11 @@ class NeuralBanditBase:
             self.network.eval()
             with torch.no_grad():
                 pred_val = self.network(X_v)
-                pred_val_obs = pred_val[torch.arange(len(a_v)), a_v]
-                val_loss = nn.MSELoss()(pred_val_obs, r_v).item()
+                if use_cf:
+                    val_loss = nn.MSELoss()(pred_val, cf_v).item()
+                else:
+                    pred_val_obs = pred_val[torch.arange(len(a_v)), a_v]
+                    val_loss = nn.MSELoss()(pred_val_obs, r_v).item()
 
             self._val_losses.append(val_loss)
             self.scheduler.step(val_loss)
@@ -561,11 +594,16 @@ class NeuralThompson(NeuralBanditBase):
         input_dim: int,
         reg_lambda: float = 1.0,
         noise_variance: float = 0.25,
+        forgetting_factor: float = 1.0,
         **kwargs,
     ):
         super().__init__(input_dim, **kwargs)
         self.reg_lambda = reg_lambda
         self.noise_variance = noise_variance
+        # G-5: forgetting factor (γ ∈ (0, 1]). γ=1.0 ⇒ no forgetting (legacy).
+        # Typical production value: 0.999 so the half-life is ~700 rounds.
+        self.forgetting_factor = float(forgetting_factor)
+        assert 0.0 < self.forgetting_factor <= 1.0
 
         feat_dim = self.network.feature_dim
 
@@ -575,23 +613,50 @@ class NeuralThompson(NeuralBanditBase):
         self.b = [np.zeros(feat_dim) for _ in range(N_TREATMENTS)]
         self.mu = [np.zeros(feat_dim) for _ in range(N_TREATMENTS)]
 
+        # G-4: online-retrain state is off by default; enable via
+        # ``enable_online_retraining`` to opt in.
+        self.replay_buffer = None
+        self.retrain_every = 0
+        self.minibatch_size = 0
+        self.retrain_epochs = 0
+        self.min_buffer_for_retrain = 0
+        self._online_step = 0
+
     def update_posterior(self, x: np.ndarray, action: int, reward: float) -> None:
-        """Update posterior for the chosen action after observing reward."""
+        """
+        Update posterior for the chosen action after observing reward.
+
+        G-5: when forgetting_factor < 1.0, the per-arm statistics decay
+        before the rank-1 update:
+            A_k ← γ * A_k + φ φᵀ
+            b_k ← γ * b_k + r φ
+        The inverse is refreshed to preserve exactness under the pre-scale.
+        """
         self.network.eval()
         with torch.no_grad():
             x_t = torch.FloatTensor(x.reshape(1, -1)).to(self.device)
             phi = self.network.get_features(x_t).cpu().numpy().flatten()
 
         k = action
+        gamma = self.forgetting_factor
+
+        if gamma < 1.0:
+            # Pre-scale A and b, refresh A_inv via exact inverse (1/γ · A_inv),
+            # then apply Sherman-Morrison for the rank-1 update. This keeps
+            # the posterior exact under the forgetting model.
+            self.A[k] = gamma * self.A[k]
+            self.b[k] = gamma * self.b[k]
+            self.A_inv[k] = self.A_inv[k] / gamma
+
         self.A[k] += np.outer(phi, phi)
         self.b[k] += reward * phi
 
-        # Update inverse via Sherman-Morrison
+        # Sherman-Morrison rank-1 update on A_inv
         phi_col = phi.reshape(-1, 1)
         A_inv = self.A_inv[k]
         numerator = A_inv @ phi_col @ phi_col.T @ A_inv
-        denominator = 1.0 + phi_col.T @ A_inv @ phi_col
-        self.A_inv[k] = A_inv - numerator / denominator.item()
+        denominator = 1.0 + (phi_col.T @ A_inv @ phi_col).item()
+        self.A_inv[k] = A_inv - numerator / denominator
 
         # Update mean
         self.mu[k] = self.A_inv[k] @ self.b[k]
@@ -652,29 +717,24 @@ class NeuralThompson(NeuralBanditBase):
             x_t = torch.FloatTensor(x.reshape(1, -1)).to(self.device)
             phi = self.network.get_features(x_t).cpu().numpy().flatten()
 
-        # ── Precompute covariance matrices (reused across draws) ──
-        covs = []
-        for k in range(N_TREATMENTS):
-            cov = self.noise_variance * self.A_inv[k]
-            cov = (cov + cov.T) / 2
-            cov += 1e-6 * np.eye(len(cov))
-            covs.append(cov)
+        # G-6: vectorise the per-draw sampling.
+        # For each arm we need scalar score φᵀθ_k with θ_k ~ N(μ_k, σ²·A_k⁻¹).
+        # Since φ is the same across draws and arms, φᵀθ_k ~ N(φᵀμ_k, σ²·φᵀA_k⁻¹φ)
+        # — a univariate normal. Sampling θ_k in d-dim was never necessary.
+        # Complexity drops from O(n_draws · K · d²) to O(K · d²) + O(n_draws · K).
+        posterior_mean_per_arm = np.array([self.mu[k] @ phi for k in range(N_TREATMENTS)])
+        posterior_var_per_arm = np.array([
+            max(self.noise_variance * float(phi @ self.A_inv[k] @ phi), 1e-12)
+            for k in range(N_TREATMENTS)
+        ])
+        posterior_std_per_arm = np.sqrt(posterior_var_per_arm)
 
-        # ── Draw from posterior n_draws times ──
-        win_counts = np.zeros(N_TREATMENTS)
-
-        for _ in range(n_draws):
-            sampled_rewards = np.zeros(N_TREATMENTS)
-            for k in range(N_TREATMENTS):
-                try:
-                    theta_k = np.random.multivariate_normal(self.mu[k], covs[k])
-                except np.linalg.LinAlgError:
-                    theta_k = self.mu[k]
-                sampled_rewards[k] = phi @ theta_k
-            winner = int(np.argmax(sampled_rewards))
-            win_counts[winner] += 1
-
-        win_rates = win_counts / n_draws
+        rng = np.random
+        z = rng.randn(n_draws, N_TREATMENTS)  # standard normal
+        samples = posterior_mean_per_arm[None, :] + z * posterior_std_per_arm[None, :]
+        winners = np.argmax(samples, axis=1)
+        win_counts = np.bincount(winners, minlength=N_TREATMENTS)
+        win_rates = win_counts / float(n_draws)
 
         # ── Posterior means (deterministic) ──
         posterior_means = np.array([self.mu[k] @ phi for k in range(N_TREATMENTS)])
@@ -728,8 +788,167 @@ class NeuralThompson(NeuralBanditBase):
         }
 
     def online_update(self, x: np.ndarray, action: int, reward: float) -> None:
-        """Update posterior after observing (x, a, r)."""
+        """
+        Update posterior after observing (x, a, r).
+
+        G-4 hook: if ``enable_online_retrain`` is on, push the transition into
+        the replay buffer and, every ``retrain_every`` steps, fine-tune the
+        backbone on a sampled mini-batch and rebuild the posterior. The
+        posterior is rebuilt from a fresh replay so the Sherman-Morrison
+        statistics stay consistent with the new features.
+        """
         self.update_posterior(x, action, reward)
+
+        if getattr(self, "replay_buffer", None) is not None:
+            self.replay_buffer.append((np.asarray(x, dtype=np.float32),
+                                       int(action), float(reward)))
+            self._online_step += 1
+            if (self._online_step % self.retrain_every == 0
+                    and len(self.replay_buffer) >= self.min_buffer_for_retrain):
+                self._periodic_retrain()
+
+    # ── G-4: online representation update ───────────────────────────────────
+    def enable_online_retraining(
+        self,
+        buffer_size: int = 50_000,
+        retrain_every: int = 2_000,
+        minibatch_size: int = 1_024,
+        retrain_epochs: int = 1,
+        min_buffer_for_retrain: int = 2_000,
+    ) -> None:
+        """
+        G-4: turn on bounded replay + periodic backbone fine-tuning. After
+        each retrain, the posterior is rebuilt from the current replay using
+        the refreshed features, so A_inv reflects the new representation.
+        """
+        from collections import deque
+        self.replay_buffer = deque(maxlen=buffer_size)
+        self.retrain_every = int(retrain_every)
+        self.minibatch_size = int(minibatch_size)
+        self.retrain_epochs = int(retrain_epochs)
+        self.min_buffer_for_retrain = int(min_buffer_for_retrain)
+        self._online_step = 0
+        logger.info(
+            f"Online retraining enabled: buffer={buffer_size}, "
+            f"retrain_every={retrain_every}, minibatch={minibatch_size}"
+        )
+
+    def _periodic_retrain(self) -> None:
+        """One periodic backbone fine-tune + posterior rebuild (G-4)."""
+        buf = self.replay_buffer
+        n = min(self.minibatch_size, len(buf))
+        idx = np.random.choice(len(buf), size=n, replace=False)
+        xs = np.stack([buf[i][0] for i in idx])
+        acts = np.array([buf[i][1] for i in idx], dtype=np.int64)
+        rews = np.array([buf[i][2] for i in idx], dtype=np.float32)
+
+        X_t = torch.FloatTensor(xs).to(self.device)
+        a_t = torch.LongTensor(acts).to(self.device)
+        r_t = torch.FloatTensor(rews).to(self.device)
+
+        self.network.train()
+        for _ in range(self.retrain_epochs):
+            self.optimizer.zero_grad()
+            pred_all = self.network(X_t)
+            pred = pred_all[torch.arange(len(a_t)), a_t]
+            loss = nn.MSELoss()(pred, r_t)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            self.optimizer.step()
+
+        # Posterior rebuild from the full buffer with the new backbone.
+        all_x = np.stack([t[0] for t in buf])
+        all_a = np.array([t[1] for t in buf], dtype=np.int64)
+        all_r = np.array([t[2] for t in buf], dtype=np.float32)
+        self.initialize_posterior(all_x, all_a, all_r, reset=True)
+        logger.info(
+            f"Periodic retrain @step {self._online_step}: "
+            f"backbone updated on {n} samples, posterior rebuilt from "
+            f"{len(buf)} buffered transitions."
+        )
+
+    def initialize_posterior(
+        self,
+        X: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        n_rows: Optional[int] = None,
+        reset: bool = True,
+    ) -> None:
+        """
+        G-1: Bootstrap the per-arm posterior from offline training data.
+
+        After ``load()`` (or ``__init__``) the posterior is the zero prior;
+        every Thompson draw is then meaningless noise — see gap analysis G-1.
+        This method is the *only* supported way to build a non-trivial
+        posterior: it replays training rows through ``update_posterior``.
+
+        Args:
+            X: (n, d) feature matrix already transformed by the same pipeline
+            actions: (n,) integer treatment indices
+            rewards: (n,) observed rewards
+            n_rows: cap the number of rows replayed (default: all)
+            reset: if True, start from the prior; otherwise accumulate on top
+        """
+        if reset:
+            self.reset_posterior()
+
+        n = X.shape[0]
+        if n_rows is not None:
+            n = min(n, n_rows)
+
+        # Batched feature extraction keeps this under a second for 20k rows.
+        self.network.eval()
+        with torch.no_grad():
+            X_t = torch.FloatTensor(X[:n]).to(self.device)
+            phis = self.network.get_features(X_t).cpu().numpy()
+
+        for i in range(n):
+            phi = phis[i]
+            k = int(actions[i])
+            r = float(rewards[i])
+            self.A[k] += np.outer(phi, phi)
+            self.b[k] += r * phi
+            phi_col = phi.reshape(-1, 1)
+            A_inv = self.A_inv[k]
+            num = A_inv @ phi_col @ phi_col.T @ A_inv
+            den = 1.0 + (phi_col.T @ A_inv @ phi_col).item()
+            self.A_inv[k] = A_inv - num / den
+
+        # Refresh per-arm means once at the end (cheaper than each step).
+        for k in range(N_TREATMENTS):
+            self.mu[k] = self.A_inv[k] @ self.b[k]
+
+        logger.info(f"Posterior bootstrapped from {n} rows (G-1 fix).")
+
+    def noise_variance_from_residuals(
+        self,
+        X: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        set_attribute: bool = True,
+        floor: float = 1e-4,
+    ) -> float:
+        """
+        G-10: estimate Gaussian observation variance from held-out residuals.
+
+        ``noise_variance`` directly sets Thompson's exploration temperature
+        (``sqrt(noise_variance)``) so eye-balling it corrupts every confidence
+        score. We predict per-arm outputs on (X, a) pairs, compute residuals
+        against the observed reward, and set ``sigma^2 = mean(residual^2)``.
+        """
+        self.network.eval()
+        with torch.no_grad():
+            X_t = torch.FloatTensor(X).to(self.device)
+            preds = self.network(X_t).cpu().numpy()
+        n = X.shape[0]
+        predicted_for_logged = preds[np.arange(n), actions.astype(int)]
+        residuals = rewards - predicted_for_logged
+        sigma2 = float(max(float(np.mean(residuals ** 2)), floor))
+        if set_attribute:
+            self.noise_variance = sigma2
+            logger.info(f"noise_variance ← {sigma2:.4f} (estimated from residuals)")
+        return sigma2
 
     def reset_posterior(self) -> None:
         """Reset posterior parameters."""
