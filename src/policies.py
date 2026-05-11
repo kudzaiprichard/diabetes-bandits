@@ -392,6 +392,28 @@ class LinUCBPolicy(BasePolicy):
         self.b = [np.zeros(d) for _ in range(N_TREATMENTS)]
         self.theta = [np.zeros(d) for _ in range(N_TREATMENTS)]
 
+    def pretrain(
+        self,
+        X: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+    ) -> None:
+        """
+        G-19: batched pre-training on logged data.
+
+        Replays (x, a, r) rows through the Sherman-Morrison update so that
+        the online comparison against NeuralThompson starts from the same
+        information state. Without this, LinUCB begins every online
+        experiment at a cold prior and is unfairly handicapped.
+        """
+        n = X.shape[0]
+        for i in range(n):
+            self.update_model(X[i], int(actions[i]), float(rewards[i]))
+        logger.info(
+            f"LinUCB pretrained on {n} rows "
+            f"(posteriors for {N_TREATMENTS} arms bootstrapped)."
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # POLICY FACTORY

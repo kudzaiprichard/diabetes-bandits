@@ -172,22 +172,44 @@ def make_random_agent() -> SimulationAgent:
     return SimulationAgent(name="random", select_fn=select_fn, update_fn=None, use_scaled=True)
 
 
+class _OracleState:
+    """
+    G-21: explicit per-agent state for the oracle agent. Replaces the
+    previous closure-dict pattern so two oracle agents don't alias the
+    same mutable context.
+    """
+
+    __slots__ = ("context",)
+
+    def __init__(self) -> None:
+        self.context: Dict = {}
+
+    def set(self, ctx: Dict) -> None:
+        self.context = dict(ctx)
+
+    def select(self) -> int:
+        rewards = [reward_oracle(self.context, t, noise=False) for t in TREATMENTS]
+        return int(np.argmax(rewards))
+
+
 def make_oracle_agent() -> SimulationAgent:
     """
     Oracle agent that always picks the best treatment.
     Used as upper bound reference — requires context dict (set during sim).
-    """
-    _current_context = {}
 
-    def set_context(ctx: Dict):
-        _current_context.update(ctx)
+    G-21: backed by an explicit ``_OracleState`` so concurrent oracle agents
+    don't alias each other.
+    """
+    state = _OracleState()
 
     def select_fn(x: np.ndarray) -> int:
-        rewards = [reward_oracle(_current_context, t, noise=False) for t in TREATMENTS]
-        return int(np.argmax(rewards))
+        return state.select()
 
-    agent = SimulationAgent(name="oracle", select_fn=select_fn, update_fn=None, use_scaled=True)
-    agent._set_context = set_context
+    agent = SimulationAgent(
+        name="oracle", select_fn=select_fn, update_fn=None, use_scaled=True,
+    )
+    agent._set_context = state.set
+    agent._oracle_state = state
     return agent
 
 
