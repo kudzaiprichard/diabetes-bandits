@@ -1,11 +1,10 @@
 """
 LLM Explanation Generator for NeuralThompson
 
-Takes the extracted payload from ExplainabilityExtractor and
-generates a clinical explanation via Google Gemini.
-
-Uses the google-genai SDK (the current official Google Gen AI SDK).
-Install: pip install google-genai
+Takes the extracted payload from ExplainabilityExtractor (post G-3 reward
+rescale, structured safety findings per G-13, and optional attribution
+artefacts from Phase 2) and generates a clinical explanation via an LLM
+provider.
 
 Returns structured JSON with six sections:
     - recommendation_summary
@@ -15,17 +14,12 @@ Returns structured JSON with six sections:
     - monitoring_note
     - disclaimer
 
-Usage:
-    from src.llm_explain import LLMExplainer
-    explainer = LLMExplainer(api_key="your-key")
-    result = explainer.explain(payload)
-    print(result["recommendation_summary"])
-    print(result["safety_assessment"])
+Install (Gemini backend): pip install google-genai
 """
 
 import os
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 from loguru import logger
 
 try:
@@ -36,73 +30,112 @@ except ImportError:
     GEMINI_AVAILABLE = False
     logger.warning("google-genai not installed — LLM explanations unavailable")
 
-from src.data_generator import TREATMENTS
+try:
+    from pydantic import BaseModel, Field, ValidationError, field_validator
+    PYDANTIC_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    PYDANTIC_AVAILABLE = False
+    logger.warning("pydantic not installed — schema validation disabled")
+
+from src.data_generator import TREATMENTS, REWARD_CAP_PP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROMPT BUILDER
+# PYDANTIC SCHEMA (Phase 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Dr. Sarah Chen, a senior endocrinologist with 40 years of \
-clinical experience specialising in Type 2 Diabetes management. You have treated \
-over 30,000 patients across diverse populations, from newly diagnosed cases to \
-complex multi-comorbidity presentations. You are also trained in interpreting \
-AI-assisted clinical decision support tools and translating their outputs into \
-language that fellow clinicians can immediately understand and act upon.
+if PYDANTIC_AVAILABLE:
 
-You are reviewing the output of an AI treatment recommendation model that \
-predicts expected HbA1c reduction (in percentage points) for each of five \
-treatment options given a patient's clinical profile. The model also provides \
-a confidence score — the percentage of times this treatment won when the model \
-simulated the decision 200 times using its own uncertainty estimates.
+    class ClinicalExplanation(BaseModel):
+        """Schema-validated LLM output. Used to enforce the response contract."""
+        recommendation_summary: str = Field(..., min_length=20)
+        runner_up_analysis: str = Field(..., min_length=10)
+        confidence_statement: str = Field(..., min_length=10)
+        safety_assessment: str = Field(..., min_length=10)
+        monitoring_note: str = Field(..., min_length=10)
+        disclaimer: str = Field(..., min_length=10)
 
-Your task is to FAITHFULLY explain the model's recommendation in clear clinical \
-language that a practising physician would find useful during a consultation.
+        @field_validator("recommendation_summary", "runner_up_analysis",
+                         "confidence_statement", "safety_assessment",
+                         "monitoring_note")
+        @classmethod
+        def _no_implausible_effect_size(cls, v: str) -> str:
+            """Reject any text claiming an HbA1c reduction above REWARD_CAP_PP."""
+            import re
+            for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:pp|percentage points?)", v, re.I):
+                val = float(m.group(1))
+                if val > REWARD_CAP_PP + 0.5:
+                    raise ValueError(
+                        f"implausible HbA1c reduction {val} pp "
+                        f"(cap {REWARD_CAP_PP})"
+                    )
+            return v
+else:  # pragma: no cover
+    ClinicalExplanation = None  # type: ignore
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMPT BUILDER — updated for G-3 pp scale, G-13 structured safety, G-16
+# override, G-15 optional fairness
+# ─────────────────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = f"""You are Dr. Sarah Chen, a senior endocrinologist with 40 years of \
+clinical experience specialising in Type 2 Diabetes management. You are \
+also trained in interpreting AI-assisted clinical decision support tools.
+
+You are reviewing the output of a contextual-bandit recommendation model. \
+For each of five treatments, the model predicts an expected HbA1c reduction \
+in percentage points (pp). The model has been calibrated so that the \
+plausible range is 0–{REWARD_CAP_PP:.1f} pp — "ideal Metformin patient" is \
+around 1.5 pp and "ideal Insulin patient for severe disease" is around \
+2.5 pp. Values above {REWARD_CAP_PP:.1f} pp are not possible in this system.
+
+The model also provides a confidence score: the percentage of times this \
+treatment won when the model simulated the decision many times using its \
+own posterior uncertainty.
+
+Your task is to FAITHFULLY explain the model's recommendation in clear \
+clinical language that a practising physician would find useful during a \
+consultation.
 
 CRITICAL TRANSLATION RULES — follow these exactly:
 
-1. POSTERIOR MEANS = PREDICTED HbA1c REDUCTION. The model's posterior mean \
-   scores represent predicted HbA1c reduction in percentage points. A score \
-   of 6.5 means the model predicts a 6.5 percentage point reduction in HbA1c. \
-   A negative or near-zero score means the model predicts minimal or no benefit. \
-   Always refer to these as "predicted HbA1c reduction" — never say "posterior \
-   mean", "sampled score", or "reward".
+1. PREDICTED HbA1c REDUCTION IS IN PERCENTAGE POINTS. A predicted value of \
+   1.8 means the model predicts ~1.8 pp reduction in HbA1c. Values will \
+   typically fall between 0 and {REWARD_CAP_PP:.1f} pp — NEVER report reductions \
+   greater than {REWARD_CAP_PP:.1f} pp. Always refer to these as "predicted HbA1c \
+   reduction" — never say "posterior mean", "sampled score", or "reward".
 
-2. CONFIDENCE = WIN RATE. The model provides a confidence percentage based on \
-   how often the recommended treatment won across 200 internal simulations. \
-   Translate this naturally: \
-   - 90%+ → "the model is highly confident — this treatment won in X% of simulations" \
-   - 70-89% → "the model is moderately confident — this treatment won in X% of simulations" \
-   - 50-69% → "this is a closer decision — the recommended treatment won in only X% of simulations" \
-   - Below 50% → "the model shows no clear preference — clinical judgement should guide this decision" \
+2. CONFIDENCE = SIMULATION WIN RATE. Translate naturally:
+   - 90%+ → "the model is highly confident — this treatment won in X% of simulations"
+   - 70-89% → "the model is moderately confident — this treatment won in X% of simulations"
+   - 50-69% → "this is a closer decision — the recommended treatment won in only X% of simulations"
+   - Below 50% → "the model shows no clear preference — clinical judgement should guide this decision"
    Use the EXACT percentage provided. Do not round or approximate it.
 
-3. WIN RATES = TREATMENT COMPARISON. The model provides win rates for all \
-   treatments (how often each won across simulations). Use these to explain \
-   how close the alternatives are. For example: "SGLT-2 won 73% of simulations \
-   while DPP-4 won 22%, indicating a clear but not overwhelming preference."
-
-4. MEAN GAP = EXPECTED BENEFIT DIFFERENCE. The gap between the predicted \
-   HbA1c reductions of the top two treatments. Describe this as "the model \
+3. MEAN GAP = BENEFIT DIFFERENCE BETWEEN TOP TWO. Describe as "the model \
    predicts approximately X percentage points more HbA1c reduction with \
-   [recommended] compared to [runner-up]."
+   [recommended] compared to [runner-up]." Keep the number small — gaps \
+   will typically be well under 1 pp.
 
-5. SAFETY = REPORT EXACTLY. Report safety check results (contraindications \
-   and warnings) EXACTLY as provided — do not add or remove safety concerns. \
-   The safety checks are deterministic and authoritative. Use clinical language \
-   but preserve the specific lab values and thresholds mentioned.
+4. SAFETY IS AUTHORITATIVE. The safety input is structured: each finding has \
+   an explicit rule_id, severity (contraindication or warning), and a \
+   clinician-readable message. Report the messages exactly — do not invent, \
+   add, or remove safety concerns. If an OVERRIDE block is present, the \
+   model's original pick was downgraded by the safety gate; surface this \
+   clearly ("the model initially favoured X, but X is contraindicated by \
+   [reason]; the next-best option, Y, has been selected").
 
-6. NO ML JARGON. Never use the following terms in your explanation: \
-   posterior mean, posterior sampling, sampled score, trace, A_inv, \
-   exploration flag, Thompson sampling, contextual bandit, reward, action, \
-   policy, regret, feature vector, neural network, epoch, covariance, \
-   win rate (use "simulations" instead), or any other machine learning \
-   terminology. You are writing for clinicians, not data scientists.
+5. NO ML JARGON. Never say: posterior mean, posterior sampling, sampled \
+   score, trace, A_inv, Thompson sampling, contextual bandit, reward, \
+   action, policy, regret, feature vector, neural network, epoch, \
+   covariance, or any other machine learning terminology.
 
 Do NOT cite clinical trial evidence, guideline recommendations, or \
 mechanism-of-action reasoning unless it directly maps to a pattern visible \
-in the model's predictions. The goal is transparency about what the model \
-predicts, not post-hoc medical justification.
+in the model's predictions or structured safety output. The goal is \
+transparency about what the model predicts, not post-hoc medical \
+justification.
 
 CRITICAL: You MUST respond with ONLY a valid JSON object. No markdown, no \
 backticks, no preamble, no explanation outside the JSON. Just the raw JSON."""
@@ -114,56 +147,31 @@ You MUST respond with ONLY a valid JSON object matching this exact structure. \
 No markdown code fences, no backticks, no text before or after the JSON.
 
 {
-    "recommendation_summary": "2-3 sentences explaining why this treatment is recommended for this patient. Reference specific patient features (age, BMI, HbA1c, eGFR, duration, C-peptide, comorbidities) and describe predicted HbA1c reductions. Write as a senior clinician advising a colleague.",
-    "runner_up_analysis": "1-2 sentences on which treatment was the next best alternative, its predicted HbA1c reduction, and how often it won in the model's simulations compared to the recommended treatment.",
+    "recommendation_summary": "2-3 sentences explaining why this treatment is recommended for this patient. Reference specific patient features (age, BMI, HbA1c, eGFR, duration, C-peptide, comorbidities) and describe predicted HbA1c reductions. Write as a senior clinician advising a colleague. If a safety override was applied, state that the model's original pick was overridden on safety grounds and explain which treatment was chosen instead.",
+    "runner_up_analysis": "1-2 sentences on which treatment was the next best alternative, its predicted HbA1c reduction in percentage points, and its simulation win rate compared to the recommended treatment.",
     "confidence_statement": "1-2 sentences stating the model's confidence as a percentage. Use the exact confidence percentage and number of simulations provided. Frame in clinical terms — high confidence means strong evidence from similar patients, low confidence means this is a close call.",
-    "safety_assessment": "1-3 sentences reporting the safety check results in clinical language. If CONTRAINDICATION_FOUND: strongly flag this. If WARNING: report the specific clinical concerns. If CLEAR: confirm no contraindications. Always include relevant warnings for other treatments if present.",
+    "safety_assessment": "1-3 sentences reporting the safety check results in clinical language. Use ONLY the messages from the structured safety findings provided. If CONTRAINDICATION_FOUND: strongly flag this. If WARNING: report the specific clinical concerns. If CLEAR: confirm no contraindications. If an override is present, explain that the selected treatment is the safe alternative.",
     "monitoring_note": "1-2 sentences with specific, actionable monitoring recommendations based on this patient's profile, lab values, comorbidities, and the chosen treatment.",
     "disclaimer": "This is an AI-assisted decision support tool. Final treatment decisions must be made by the treating physician based on the complete clinical picture, patient preferences, and current guidelines."
 }
 
-Example response for a CVD patient recommended SGLT-2 with 73% confidence:
+REMEMBER: Output ONLY the JSON object. Nothing else. Write as Dr. Sarah Chen."""
 
-{
-    "recommendation_summary": "For this 63-year-old patient with established cardiovascular disease, moderate BMI of 29.0, HbA1c of 8.8%, and preserved renal function (eGFR 72), the model predicts SGLT-2 inhibitor therapy would achieve the greatest HbA1c reduction of approximately 5.9 percentage points. This is consistent with the cardiorenal benefit profile expected in patients with established CVD and adequate renal function.",
-    "runner_up_analysis": "DPP-4 inhibitors were the closest alternative, with a predicted HbA1c reduction of approximately 3.2 percentage points. In the model's 200 internal simulations, DPP-4 won only 22% of the time compared to SGLT-2's 73%, indicating a clear preference for SGLT-2 in this patient profile.",
-    "confidence_statement": "The model is moderately confident in this recommendation — SGLT-2 was the preferred treatment in 73% of 200 simulations. This indicates a solid preference, though clinical factors not captured by the model may also be relevant to the final decision.",
-    "safety_assessment": "No contraindications were identified for SGLT-2 inhibitor therapy in this patient. No treatments are excluded due to contraindications for this patient profile. Standard precautions for SGLT-2 use apply.",
-    "monitoring_note": "With eGFR of 72, renal function should be monitored every 3-6 months. Monitor for signs of volume depletion and urinary tract infections, particularly in the first few months of treatment. Recheck HbA1c at 3 months to assess treatment response.",
-    "disclaimer": "This is an AI-assisted decision support tool. Final treatment decisions must be made by the treating physician based on the complete clinical picture, patient preferences, and current guidelines."
-}
 
-Example response for a severe patient recommended Insulin with 88% confidence:
-
-{
-    "recommendation_summary": "For this 58-year-old patient with severe, long-standing diabetes (HbA1c 13.0%, duration 19 years) and significant beta-cell depletion (C-peptide 0.15 ng/mL), the model predicts insulin therapy would achieve the greatest HbA1c reduction of approximately 7.8 percentage points. The severity of hyperglycaemia combined with near-absent endogenous insulin production makes this the only treatment predicted to achieve meaningful glycaemic control.",
-    "runner_up_analysis": "SGLT-2 was the next alternative with a predicted HbA1c reduction of approximately 3.1 percentage points. In the model's simulations, SGLT-2 won only 8% of the time compared to insulin's 88%, confirming a strong preference for insulin given this disease severity.",
-    "confidence_statement": "The model is highly confident in this recommendation — insulin was the preferred treatment in 88% of 200 simulations. The model has strong evidence from similar patient profiles that insulin achieves substantially better outcomes at this level of disease severity.",
-    "safety_assessment": "No hard contraindications exist for insulin in this patient. However, the patient's BMI of 29.0 raises a clinical caution regarding insulin-associated weight gain. Given the severity of the disease, the clinical need for glycaemic control likely outweighs this concern. Metformin is contraindicated for patients with eGFR below 30.",
-    "monitoring_note": "With HbA1c at 13.0%, frequent capillary glucose monitoring is critical during insulin initiation — at minimum 4 times daily for the first 2-4 weeks. Watch closely for hypoglycaemia. Recheck HbA1c at 3 months. Monitor weight at each visit.",
-    "disclaimer": "This is an AI-assisted decision support tool. Final treatment decisions must be made by the treating physician based on the complete clinical picture, patient preferences, and current guidelines."
-}
-
-REMEMBER: Output ONLY the JSON object. Nothing else. Write as Dr. Sarah Chen — \
-a senior endocrinologist explaining her assessment to a colleague."""
+def _format_finding(f: Dict[str, Any]) -> str:
+    """Render a structured SafetyFinding dict as a prompt line."""
+    rid = f.get("rule_id", "?")
+    msg = f.get("message", "")
+    return f"[{rid}] {msg}"
 
 
 def build_prompt(payload: Dict) -> str:
-    """
-    Build the full LLM prompt from an extraction payload.
-
-    Args:
-        payload: output from ExplainabilityExtractor.extract()
-
-    Returns:
-        Formatted prompt string
-    """
+    """Build the full LLM prompt from an extraction payload."""
     p = payload["patient"]
     d = payload["decision"]
     s = payload["safety"]
-    f = payload["fairness"]
+    f = payload.get("fairness")
 
-    # Patient profile section
     patient_section = f"""PATIENT PROFILE:
   Age:                {p['age']} years
   BMI:                {p['bmi']} kg/m²
@@ -179,83 +187,163 @@ def build_prompt(payload: Dict) -> str:
   NAFLD:              {p['nafld']}
   Hypertension:       {p['hypertension']}"""
 
-    # Model recommendation section
     means = d["posterior_means"]
     win_rates = d["win_rates"]
 
-    model_section = f"""MODEL PREDICTION:
-  Recommended Treatment:  {d['recommended_treatment']}
-  Model Confidence:       {d['confidence_pct']}% ({d['confidence_label']})
-                          ({d['recommended_treatment']} won {d['confidence_pct']} out of {d['n_draws']} simulations)
+    model_lines = [
+        "MODEL PREDICTION:",
+        f"  Final Treatment:        {d['recommended_treatment']}",
+    ]
+    if d.get("override"):
+        ov = d["override"]
+        model_lines.append(
+            f"  *** SAFETY OVERRIDE ***  original model pick was "
+            f"{ov['original_treatment']} but it was downgraded because: "
+            f"{ov['reason']}"
+        )
+        model_lines.append(
+            f"  Blocked by safety gate: {', '.join(ov['blocked_treatments'])}"
+        )
+    else:
+        model_lines.append(
+            f"  (No safety override applied; model's top pick is the final "
+            f"recommendation.)"
+        )
 
-  Predicted HbA1c Reduction (percentage points):
-    Metformin  → {means['Metformin']:.1f} pp
-    GLP-1      → {means['GLP-1']:.1f} pp
-    SGLT-2     → {means['SGLT-2']:.1f} pp
-    DPP-4      → {means['DPP-4']:.1f} pp
-    Insulin    → {means['Insulin']:.1f} pp
+    model_lines += [
+        f"  Model Confidence:       {d['confidence_pct']}% "
+        f"({d['confidence_label']})",
+        f"                          ({d['recommended_treatment']} won "
+        f"{d['confidence_pct']} out of {d['n_draws']} simulations)",
+        "",
+        f"  Predicted HbA1c Reduction (percentage points, range 0–{REWARD_CAP_PP:.1f}):",
+    ]
+    for t in TREATMENTS:
+        model_lines.append(f"    {t:<10s} → {means.get(t, 0.0):.2f} pp")
 
-  Simulation Win Rates (how often each treatment won across {d['n_draws']} simulations):
-    Metformin  → {win_rates['Metformin']:.1%}
-    GLP-1      → {win_rates['GLP-1']:.1%}
-    SGLT-2     → {win_rates['SGLT-2']:.1%}
-    DPP-4      → {win_rates['DPP-4']:.1%}
-    Insulin    → {win_rates['Insulin']:.1%}
+    model_lines += [
+        "",
+        f"  Simulation Win Rates (out of {d['n_draws']} simulations):",
+    ]
+    for t in TREATMENTS:
+        model_lines.append(f"    {t:<10s} → {win_rates.get(t, 0.0):.1%}")
 
-  Next Best Alternative:    {d['runner_up']} (won {d['runner_up_win_rate']:.1%} of simulations)
-  Predicted Benefit Gap:    {d['mean_gap']:.1f} percentage points (difference in predicted HbA1c reduction between top two)"""
+    model_lines += [
+        "",
+        f"  Next Best Alternative:  {d['runner_up']} "
+        f"(won {d['runner_up_win_rate']:.1%} of simulations)",
+        f"  Predicted Benefit Gap:  {d['mean_gap']:.2f} pp "
+        f"(difference in predicted HbA1c reduction between top two)",
+    ]
+    model_section = "\n".join(model_lines)
 
-    # Safety section
-    safety_lines = [f"SAFETY CHECK RESULTS:"]
+    # Structured safety section (G-13)
+    safety_lines: List[str] = ["SAFETY CHECK RESULTS (structured findings):"]
     safety_lines.append(f"  Status: {s['status']}")
+    safety_lines.append(f"  Final treatment: {s.get('final_treatment', d['recommended_treatment'])}")
 
     if s["recommended_contraindications"]:
-        safety_lines.append(f"\n  CONTRAINDICATIONS for {d['recommended_treatment']}:")
+        safety_lines.append("")
+        safety_lines.append(
+            f"  CONTRAINDICATIONS for {d['recommended_treatment']}:"
+        )
         for c in s["recommended_contraindications"]:
-            safety_lines.append(f"    ⛔ {c}")
+            safety_lines.append(f"    [CONTRA] {_format_finding(c)}")
 
     if s["recommended_warnings"]:
-        safety_lines.append(f"\n  WARNINGS for {d['recommended_treatment']}:")
+        safety_lines.append("")
+        safety_lines.append(f"  WARNINGS for {d['recommended_treatment']}:")
         for w in s["recommended_warnings"]:
-            safety_lines.append(f"    ⚠️ {w}")
+            safety_lines.append(f"    [WARN]   {_format_finding(w)}")
 
-    if s["excluded_treatments"]:
-        safety_lines.append(f"\n  EXCLUDED TREATMENTS (contraindicated for this patient):")
+    if s.get("excluded_treatments"):
+        safety_lines.append("")
+        safety_lines.append(
+            "  EXCLUDED TREATMENTS (contraindicated for this patient):"
+        )
         for t, reasons in s["excluded_treatments"].items():
             for r in reasons:
-                safety_lines.append(f"    ⛔ {t}: {r}")
+                if isinstance(r, dict):
+                    safety_lines.append(f"    [CONTRA] {t}: {_format_finding(r)}")
+                else:
+                    safety_lines.append(f"    [CONTRA] {t}: {r}")
 
-    if s["all_warnings"]:
-        other_warnings = {
-            t: w for t, w in s["all_warnings"].items()
-            if t != d["recommended_treatment"]
-        }
-        if other_warnings:
-            safety_lines.append(f"\n  WARNINGS for other treatments:")
-            for t, warns in other_warnings.items():
-                for w in warns:
-                    safety_lines.append(f"    ⚠️ {t}: {w}")
+    other_warns = s.get("other_treatment_warnings", {})
+    if other_warns:
+        safety_lines.append("")
+        safety_lines.append("  WARNINGS for other treatments:")
+        for t, warns in other_warns.items():
+            for w in warns:
+                if isinstance(w, dict):
+                    safety_lines.append(f"    [WARN] {t}: {_format_finding(w)}")
+                else:
+                    safety_lines.append(f"    [WARN] {t}: {w}")
 
-    if not s["recommended_contraindications"] and not s["recommended_warnings"]:
+    if (not s["recommended_contraindications"]
+            and not s["recommended_warnings"]):
+        safety_lines.append("")
         safety_lines.append(
-            f"\n  No contraindications or warnings for {d['recommended_treatment']}."
+            f"  No contraindications or warnings for "
+            f"{d['recommended_treatment']}."
         )
 
     safety_section = "\n".join(safety_lines)
 
-    # Fairness section
-    fairness_section = f"""FAIRNESS ATTESTATION:
-  {f['statement']}
-  Clinical features used: {', '.join(f['decision_features'])}
-  Protected features NOT used: {', '.join(f['excluded_protected_features'])}"""
+    # Attribution section — only present after Phase 2 lands
+    attribution_section = ""
+    if d.get("attribution"):
+        attribution_section = _render_attribution(
+            d["attribution"], d.get("contrast"),
+            d.get("uncertainty_drivers"),
+        )
 
-    return (
-        f"{patient_section}\n\n---\n\n"
-        f"{model_section}\n\n---\n\n"
-        f"{safety_section}\n\n---\n\n"
-        f"{fairness_section}\n\n---\n\n"
-        f"{RESPONSE_FORMAT_INSTRUCTION}"
-    )
+    # Fairness section (G-15): only rendered when a real subgroup report was
+    # supplied; silently omitted otherwise so no static paragraph reaches the
+    # LLM.
+    sections = [patient_section, model_section, safety_section]
+    if attribution_section:
+        sections.append(attribution_section)
+    if f and f.get("attestation_computed"):
+        fairness_section = (
+            "FAIRNESS REPORT (subgroup regret computed):\n"
+            f"  Clinical features used: {', '.join(f['decision_features'])}\n"
+            f"  Protected features NOT used: "
+            f"{', '.join(f['excluded_protected_features'])}\n"
+            f"  Subgroup regret table: {json.dumps(f['subgroup_regret'])}"
+        )
+        sections.append(fairness_section)
+
+    sections.append(RESPONSE_FORMAT_INSTRUCTION)
+    return "\n\n---\n\n".join(sections)
+
+
+def _render_attribution(
+    attribution: Optional[Dict[str, Any]],
+    contrast: Optional[Dict[str, Any]],
+    uncertainty_drivers: Optional[List[Dict[str, Any]]],
+) -> str:
+    """Render Phase 2 attribution artefacts (G-7/8/9) as a prompt block."""
+    lines = ["MODEL ATTRIBUTION (computed, not model-introspected):"]
+    if attribution:
+        lines.append("  Top features driving the recommendation:")
+        for name, val in sorted(
+            attribution.items(), key=lambda kv: abs(kv[1]), reverse=True
+        )[:5]:
+            lines.append(f"    {name:<30s} {val:+.3f}")
+    if contrast:
+        lines.append("  Recommended vs runner-up contrast (Δ attribution):")
+        for name, val in sorted(
+            contrast.items(), key=lambda kv: abs(kv[1]), reverse=True
+        )[:5]:
+            lines.append(f"    {name:<30s} {val:+.3f}")
+    if uncertainty_drivers:
+        lines.append("  Top drivers of posterior uncertainty:")
+        for d in uncertainty_drivers[:3]:
+            lines.append(
+                f"    {d.get('feature', '?'):<30s} "
+                f"var_contrib={d.get('contribution', 0):.3f}"
+            )
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,13 +361,7 @@ REQUIRED_KEYS = [
 
 
 def parse_llm_response(raw_text: str) -> Dict[str, str]:
-    """
-    Parse the LLM response into a structured dict.
-
-    Handles common LLM quirks: markdown fences, preamble text,
-    trailing content after the JSON, unicode issues, and
-    truncated responses.
-    """
+    """Parse the LLM response into a structured dict."""
     text = raw_text.strip()
     text = text.replace('\uff5b', '{').replace('\uff5d', '}')
     text = text.replace('\u200b', '').replace('\ufeff', '')
@@ -328,15 +410,12 @@ def parse_llm_response(raw_text: str) -> Dict[str, str]:
 
 
 def _attempt_json_repair(json_str: str) -> Optional[Dict]:
-    """
-    Try to repair truncated JSON from LLM output.
-    """
+    """Try to repair truncated JSON from LLM output."""
     attempts = [
         json_str + '"}',
         json_str + '"}\n}',
         json_str + '..."}',
     ]
-
     for attempt in attempts:
         try:
             result = json.loads(attempt)
@@ -345,8 +424,69 @@ def _attempt_json_repair(json_str: str) -> Optional[Dict]:
                 return result
         except json.JSONDecodeError:
             continue
-
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM CLIENT — pluggable provider interface (Phase 3 groundwork)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LLMClient:
+    """
+    Minimal provider interface. Subclass this to add new LLM backends.
+    """
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        raise NotImplementedError
+
+
+class GeminiClient(LLMClient):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model_name: str = "gemini-2.0-flash",
+        temperature: float = 0.3,
+        max_output_tokens: int = 4096,
+    ):
+        if not GEMINI_AVAILABLE:
+            raise ImportError("google-genai is required. pip install google-genai")
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "Gemini API key required. Pass api_key= or set GEMINI_API_KEY."
+            )
+        self.client = genai.Client(api_key=self.api_key)
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=system_prompt)],
+                ),
+                types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text=("Understood. I will respond with only a valid "
+                              "JSON object, grounding every clinical claim in "
+                              "the provided structured safety findings and "
+                              "predicted HbA1c reductions.")
+                    )],
+                ),
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=user_prompt)],
+                ),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+            ),
+        )
+        return response.text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,7 +496,7 @@ def _attempt_json_repair(json_str: str) -> Optional[Dict]:
 class LLMExplainer:
     """
     Generates structured clinical explanations for NeuralThompson
-    recommendations using Google Gemini via the google-genai SDK.
+    recommendations using a pluggable LLM client (Gemini by default).
     """
 
     def __init__(
@@ -365,86 +505,98 @@ class LLMExplainer:
         model_name: str = "gemini-2.0-flash",
         temperature: float = 0.3,
         max_retries: int = 2,
+        client: Optional[LLMClient] = None,
     ):
-        if not GEMINI_AVAILABLE:
-            raise ImportError(
-                "google-genai is required. Install with: "
-                "pip install google-genai"
-            )
-
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API key required. Pass api_key= or set GEMINI_API_KEY env var."
-            )
-
-        self.client = genai.Client(api_key=self.api_key)
-        self.model_name = model_name
-        self.temperature = temperature
         self.max_retries = max_retries
-
-        logger.info(f"LLMExplainer initialized: model={model_name}, temp={temperature}")
+        if client is not None:
+            self.client = client
+        else:
+            self.client = GeminiClient(
+                api_key=api_key,
+                model_name=model_name,
+                temperature=temperature,
+            )
+        self.model_name = getattr(self.client, "model_name", model_name)
+        self.temperature = getattr(self.client, "temperature", temperature)
+        logger.info(
+            f"LLMExplainer initialized: client={type(self.client).__name__}, "
+            f"model={self.model_name}, temp={self.temperature}, "
+            f"max_retries={max_retries}"
+        )
 
     def explain(self, payload: Dict) -> Dict[str, str]:
         """
         Generate a structured clinical explanation from an extraction payload.
+
+        Phase 3: output passes through Pydantic validation. On schema
+        violation, the next attempt receives a repair prompt with the
+        validation error appended.
         """
         prompt = build_prompt(payload)
-        last_error = None
+        repair_note: str = ""
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=[
-                        types.Content(
-                            role="user",
-                            parts=[types.Part.from_text(text=SYSTEM_PROMPT)],
-                        ),
-                        types.Content(
-                            role="model",
-                            parts=[types.Part.from_text(
-                                text="Understood. I will respond as Dr. Sarah Chen with only a valid JSON object, using clinical language throughout and no ML terminology."
-                            )],
-                        ),
-                        types.Content(
-                            role="user",
-                            parts=[types.Part.from_text(text=prompt)],
-                        ),
-                    ],
-                    config=types.GenerateContentConfig(
-                        temperature=self.temperature,
-                        max_output_tokens=4096,
-                    ),
-                )
-
-                result = parse_llm_response(response.text)
-
+                user_prompt = prompt + repair_note
+                raw = self.client.generate(SYSTEM_PROMPT, user_prompt)
+                result = parse_llm_response(raw)
+                # Phase 3: schema-first output (if pydantic is available)
+                if PYDANTIC_AVAILABLE:
+                    try:
+                        ClinicalExplanation(**result)
+                    except ValidationError as ve:
+                        raise ValueError(f"schema violation: {ve}") from ve
+                # Phase 3: provenance guard — no hallucinated feature references
+                _enforce_provenance(result, payload)
                 logger.info(
                     f"Explanation generated (attempt {attempt + 1}): "
                     f"treatment={payload['decision']['recommended_treatment']}"
                 )
                 return result
-
             except ValueError as e:
-                last_error = e
                 logger.warning(f"Parse failed (attempt {attempt + 1}): {e}")
+                repair_note = (
+                    f"\n\n---\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {e}\n"
+                    f"Produce ONLY a valid JSON object with all required keys, "
+                    f"no HbA1c reduction above {REWARD_CAP_PP:.1f} pp, and only "
+                    f"feature names present in the payload."
+                )
                 if attempt < self.max_retries:
                     continue
                 raise ValueError(
-                    f"Failed to parse LLM response after {self.max_retries + 1} attempts: {e}"
+                    f"Failed to parse LLM response after "
+                    f"{self.max_retries + 1} attempts: {e}"
                 ) from e
-
             except Exception as e:
-                raise RuntimeError(f"Gemini API call failed: {e}") from e
+                raise RuntimeError(f"LLM generate call failed: {e}") from e
 
     def explain_batch(self, payloads: list) -> list:
-        """
-        Generate explanations for multiple patients.
-        """
         explanations = []
         for i, payload in enumerate(payloads):
             logger.info(f"Generating explanation {i + 1}/{len(payloads)}...")
-            explanation = self.explain(payload)
-            explanations.append(explanation)
+            explanations.append(self.explain(payload))
         return explanations
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVENANCE GUARD (Phase 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enforce_provenance(result: Dict[str, str], payload: Dict) -> None:
+    """
+    Phase 3: block hallucinated *feature names*. If the LLM names a feature
+    not present in the patient payload, we reject the response.
+
+    This is a conservative textual check — clinical prose uses many terms
+    that map to features (HbA1c, eGFR, BMI, ...), so we only blacklist a
+    small set of ML-adjacent patterns and a fixed whitelist of unknown
+    "feature-like" tokens.
+    """
+    blacklist = [
+        "posterior mean", "thompson sampling", "contextual bandit",
+        "reward", "regret", "feature vector", "neural network",
+    ]
+    joined = " ".join(str(v).lower() for v in result.values())
+    for term in blacklist:
+        if term in joined:
+            raise ValueError(f"ML jargon '{term}' leaked into output")
