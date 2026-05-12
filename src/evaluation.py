@@ -120,6 +120,77 @@ def direct_method(
     }
 
 
+def truncated_ips(
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    pscores: np.ndarray,
+    policy_probs: np.ndarray,
+    clip_weight: float = 10.0,
+) -> Dict[str, float]:
+    """
+    G-17: IPS with explicit importance-weight clipping.
+
+    Returns the value, a confidence interval, and the fraction of samples
+    whose weight was clipped — auditable so a reviewer can see the
+    bias/variance trade-off that was taken.
+    """
+    n = len(actions)
+    pi_a = policy_probs[np.arange(n), actions]
+    raw_weights = pi_a / np.clip(pscores, 1e-6, None)
+    clipped_weights = np.minimum(raw_weights, float(clip_weight))
+    clipped_fraction = float((raw_weights > clip_weight).mean())
+    value = float((rewards * clipped_weights).mean())
+    se = float(np.std(rewards * clipped_weights) / np.sqrt(n))
+    return {
+        "value": round(value, 4),
+        "std_error": round(se, 4),
+        "ci_lower": round(value - 1.96 * se, 4),
+        "ci_upper": round(value + 1.96 * se, 4),
+        "clipped_fraction": round(clipped_fraction, 4),
+        "clip_weight": float(clip_weight),
+    }
+
+
+def switch_estimator(
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    pscores: np.ndarray,
+    policy_probs: np.ndarray,
+    reward_predictions: np.ndarray,
+    tau: float = 10.0,
+) -> Dict[str, float]:
+    """
+    G-18: Switch estimator (Wang, Agarwal & Dudik 2017).
+
+    For each row, if the importance weight exceeds τ we fall back to the
+    reward-model value (direct method); otherwise we use the IPS term. The
+    hybrid has strictly lower variance than IPS and is unbiased under the
+    usual DR assumptions.
+    """
+    n = len(actions)
+    pi_a = policy_probs[np.arange(n), actions]
+    weights = pi_a / np.clip(pscores, 1e-6, None)
+    use_dm = weights > float(tau)
+
+    dm_values = (policy_probs * reward_predictions).sum(axis=1)
+    predicted_for_logged = reward_predictions[np.arange(n), actions]
+    ips_term = np.where(use_dm, 0.0, weights * rewards)
+    dm_term = np.where(use_dm, dm_values, 0.0)
+    switch_values = dm_term + ips_term
+
+    value = float(switch_values.mean())
+    se = float(switch_values.std() / np.sqrt(n))
+    switch_fraction = float(use_dm.mean())
+    return {
+        "value": round(value, 4),
+        "std_error": round(se, 4),
+        "ci_lower": round(value - 1.96 * se, 4),
+        "ci_upper": round(value + 1.96 * se, 4),
+        "switch_fraction": round(switch_fraction, 4),
+        "tau": float(tau),
+    }
+
+
 def doubly_robust(
     actions: np.ndarray,
     rewards: np.ndarray,
@@ -433,3 +504,122 @@ def softmax_probs(
     logits -= logits.max(axis=1, keepdims=True)
     exp_logits = np.exp(logits)
     return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALIBRATION DIAGNOSTICS (G-11)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def expected_calibration_error(
+    confidence_pcts: np.ndarray,
+    correctness: np.ndarray,
+    n_bins: int = 10,
+) -> float:
+    """
+    Expected Calibration Error (ECE).
+
+    Bins predictions by predicted confidence (0-100), then computes the
+    weighted absolute gap between mean confidence and empirical accuracy in
+    each bin. Values close to 0 indicate a calibrated classifier.
+
+    Args:
+        confidence_pcts: (n,) integer confidence percentages in [0, 100]
+        correctness: (n,) bool/int indicating whether prediction was correct
+        n_bins: number of equal-width bins over [0, 100]
+
+    Returns:
+        ECE as a float in [0, 1].
+    """
+    c = np.asarray(confidence_pcts, dtype=float) / 100.0
+    y = np.asarray(correctness, dtype=float)
+    assert c.shape == y.shape, (c.shape, y.shape)
+    n = len(c)
+    if n == 0:
+        return 0.0
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (c >= lo) & (c <= hi)
+        else:
+            mask = (c >= lo) & (c < hi)
+        if not mask.any():
+            continue
+        bin_conf = c[mask].mean()
+        bin_acc = y[mask].mean()
+        bin_weight = mask.sum() / n
+        ece += bin_weight * abs(bin_conf - bin_acc)
+    return float(ece)
+
+
+def reliability_diagram(
+    confidence_pcts: np.ndarray,
+    correctness: np.ndarray,
+    n_bins: int = 10,
+) -> Dict[str, np.ndarray]:
+    """
+    Return the tabular data for a reliability diagram.
+
+    Callers render the plot; this keeps ``src/evaluation.py`` free of
+    matplotlib hard-dependencies.
+
+    Returns:
+        {"bin_centers": (n_bins,), "bin_confidence": (n_bins,),
+         "bin_accuracy":  (n_bins,), "bin_counts":     (n_bins,)}
+        Bins with zero members have NaN for confidence/accuracy.
+    """
+    c = np.asarray(confidence_pcts, dtype=float) / 100.0
+    y = np.asarray(correctness, dtype=float)
+    assert c.shape == y.shape
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    conf = np.full(n_bins, np.nan)
+    acc = np.full(n_bins, np.nan)
+    counts = np.zeros(n_bins, dtype=int)
+
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (c >= lo) & (c <= hi)
+        else:
+            mask = (c >= lo) & (c < hi)
+        counts[i] = int(mask.sum())
+        if counts[i] > 0:
+            conf[i] = float(c[mask].mean())
+            acc[i] = float(y[mask].mean())
+    return {
+        "bin_centers": centers,
+        "bin_confidence": conf,
+        "bin_accuracy": acc,
+        "bin_counts": counts,
+    }
+
+
+def confidence_label_accuracy(
+    confidence_labels: np.ndarray,
+    correctness: np.ndarray,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Bucket accuracy by HIGH/MODERATE/LOW confidence label (G-11 success criterion).
+
+    Args:
+        confidence_labels: (n,) array of strings in {HIGH, MODERATE, LOW}
+        correctness: (n,) bool/int indicating whether the prediction was correct
+
+    Returns:
+        {label: {"n": count, "accuracy": mean_correct}}
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    labels = np.asarray(confidence_labels)
+    y = np.asarray(correctness, dtype=float)
+    for lab in ("HIGH", "MODERATE", "LOW"):
+        mask = labels == lab
+        n = int(mask.sum())
+        out[lab] = {
+            "n": n,
+            "accuracy": float(y[mask].mean()) if n > 0 else float("nan"),
+        }
+    return out
