@@ -16,6 +16,8 @@ Helpers:
 - Results export
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -23,6 +25,12 @@ import matplotlib.ticker as ticker
 import seaborn as sns
 from typing import Dict, List, Optional, Tuple
 from loguru import logger
+
+
+def _savefig(fig: plt.Figure, save_path: str) -> None:
+    """Save *fig* to *save_path*, creating parent directories if needed."""
+    Path(save_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path)
 from contextlib import contextmanager
 import time
 import os
@@ -90,7 +98,7 @@ def plot_cumulative_regret(
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x/1000:.0f}k" if x >= 1000 else f"{x:.0f}"))
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
         logger.info(f"Saved plot: {save_path}")
     plt.tight_layout()
     return fig
@@ -115,7 +123,7 @@ def plot_cumulative_reward(
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x/1000:.0f}k" if x >= 1000 else f"{x:.0f}"))
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -146,7 +154,7 @@ def plot_learning_curves(
     ax.legend()
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -174,7 +182,7 @@ def plot_regret_and_accuracy(
     ax2.legend()
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -207,7 +215,7 @@ def plot_policy_comparison(
                 f"{val:.4f}", va="center", fontsize=10)
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -240,7 +248,7 @@ def plot_action_distribution(
     ax.set_xlim(0, 1)
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -272,7 +280,7 @@ def plot_feature_importance(
     fig.suptitle("Feature Importance by Treatment Model", fontsize=14, y=1.02)
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -305,7 +313,7 @@ def plot_predicted_vs_actual(
     fig.suptitle("Predicted vs Actual Rewards", fontsize=14, y=1.02)
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -329,7 +337,7 @@ def plot_training_loss(
     ax.legend()
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -357,7 +365,7 @@ def plot_subgroup_heatmap(
         logger.warning("No treatment percentage columns for heatmap")
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
@@ -404,7 +412,7 @@ def plot_ope_comparison(
     ax.set_title(f"OPE Estimates — {policy_name}")
 
     if save_path:
-        fig.savefig(save_path)
+        _savefig(fig, save_path)
     plt.tight_layout()
     return fig
 
